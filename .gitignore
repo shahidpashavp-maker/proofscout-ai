@@ -5,3 +5,5 @@ dist-server/
 .env.*
 !.env.example
 *.tsbuildinfo
+/data/*.sqlite
+/data/*.sqlite-*

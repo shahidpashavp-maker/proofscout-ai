@@ -104,9 +104,12 @@ function getMcpUrl(): URL {
   try {
     const url = new URL(value);
     if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new Error();
+    if (process.env.NODE_ENV === 'production' && url.protocol !== 'https:') throw new Error();
     return url;
   } catch {
-    throw new TinyFishAuthConfigurationError('TINYFISH_MCP_URL must be a valid HTTP or HTTPS URL.');
+    throw new TinyFishAuthConfigurationError(process.env.NODE_ENV === 'production'
+      ? 'TINYFISH_MCP_URL must be a valid HTTPS URL in production.'
+      : 'TINYFISH_MCP_URL must be a valid HTTP or HTTPS URL.');
   }
 }
 
@@ -208,10 +211,10 @@ export async function completeTinyFishAuthorization(session: TinyFishOAuthSessio
   }
 }
 
-export async function searchWeb(query: string, session: TinyFishOAuthSession | undefined): Promise<SearchResult[]> {
+export async function searchWeb(query: string, session: TinyFishOAuthSession | undefined, signal?: AbortSignal): Promise<SearchResult[]> {
   return withClient(session, async (client) => {
     const toolName = await findTool(client, 'search');
-    const result = await client.callTool({ name: toolName, arguments: { query, purpose: 'Find relevant live webpages to support a research question.' } }) as McpResult;
+    const result = await client.callTool({ name: toolName, arguments: { query, purpose: 'Find relevant live webpages to support a research question.' } }, undefined, signal ? { signal } : undefined) as McpResult;
     if (result.isError) throwToolFailure(result, 'Search', resolveTinyFishAuthSelection().mode, [process.env.TINYFISH_MCP_TOKEN ?? '', session?.tokens?.access_token ?? '', session?.tokens?.refresh_token ?? '']);
     const results = extractSearchResults(getText(result));
     if (!results.length) throw new TinyFishError('TinyFish Search returned no usable webpage URLs. Try a more specific question.', 'upstream');
@@ -233,19 +236,20 @@ export function associateFetchedPages(urls: string[], result: McpResult): FetchR
   });
 }
 
-export async function fetchPagesForQuery(query: string, urls: string[], request: (arguments_: Record<string, unknown>) => Promise<McpResult>): Promise<FetchResult[]> {
+export async function fetchPagesForQuery(query: string, urls: string[], request: (arguments_: Record<string, unknown>) => Promise<McpResult>, signal?: AbortSignal): Promise<FetchResult[]> {
   const result = await request({
     query, urls, format: 'markdown', links: false, image_links: false, iframe_links: false, page_metadata: true,
     purpose: 'Extract factual evidence relevant to the user’s research question.',
   });
+  if (signal?.aborted) throw new TinyFishError('TinyFish Fetch request was cancelled.', 'upstream');
   if (result.isError) throw new TinyFishError('TinyFish Fetch rejected the request.', 'upstream');
   return associateFetchedPages(urls, result);
 }
 
-export async function fetchPages(query: string, urls: string[], session: TinyFishOAuthSession | undefined): Promise<FetchResult[]> {
+export async function fetchPages(query: string, urls: string[], session: TinyFishOAuthSession | undefined, signal?: AbortSignal): Promise<FetchResult[]> {
   return withClient(session, async (client) => {
     const toolName = await findTool(client, 'fetch_content');
-    return fetchPagesForQuery(query, urls, async (arguments_) => client.callTool({ name: toolName, arguments: arguments_ }) as Promise<McpResult>);
+    return fetchPagesForQuery(query, urls, async (arguments_) => client.callTool({ name: toolName, arguments: arguments_ }, undefined, signal ? { signal } : undefined) as Promise<McpResult>, signal);
   });
 }
 

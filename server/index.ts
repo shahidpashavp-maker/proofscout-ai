@@ -3,12 +3,41 @@ import express from 'express';
 import cors from 'cors';
 import { beginTinyFishAuthorization, checkTinyFishHealth, completeTinyFishAuthorization, fetchPages, searchWeb, tinyFishHttpStatus } from './tinyfish.js';
 import { buildEvidence } from './evidence.js';
+import verificationRouter from './routes/verification.js';
+import { createVerificationRecord } from './services/verification.js';
+import comparisonRouter from './routes/comparison.js';
+import projectsRouter from './routes/projects.js';
+import monitoringRouter from './routes/monitoring.js';
+import { db } from './database/db.js';
+import { startMonitoringScheduler } from './services/monitor-scheduler.js';
+import { createRequestLimiter } from './middleware/request-limits.js';
+import { fetchClientKey, isRecentSearchResult, isSafePublicWebUrl, rememberSearchResults } from './services/fetch-policy.js';
 import { consumeOAuthState, createSession, getOAuthConfig, hasOAuthTokens, readSession } from './tinyfish-oauth.js';
 import { getSelectedTinyFishAuthMode, resolveTinyFishAuthSelection } from './tinyfish-auth.js';
 
 const app = express();
-app.use(cors());
+const appOriginValue = process.env.PROOFSCOUT_APP_URL?.trim() || 'http://localhost:5173';
+let configuredAppOrigin = 'http://localhost:5173';
+try { configuredAppOrigin = new URL(appOriginValue).origin; } catch { /* OAuth configuration validation reports malformed deployment URLs. */ }
+const allowedOrigins = new Set([configuredAppOrigin]);
+if (process.env.NODE_ENV !== 'production' && configuredAppOrigin === 'http://localhost:5173') allowedOrigins.add('http://127.0.0.1:5173');
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin || allowedOrigins.has(origin)) return callback(null, true);
+    return callback(new Error('Cross-origin request denied.'));
+  },
+  credentials: true,
+}));
 app.use(express.json({ limit: '32kb' }));
+app.use('/api', createRequestLimiter('api', 300, 60_000));
+app.use('/api/search', createRequestLimiter('search', 20, 60_000));
+app.use('/api/fetch', createRequestLimiter('fetch', 12, 60_000));
+app.use('/api/auth', createRequestLimiter('auth', 12, 60_000));
+app.use('/api/monitoring', createRequestLimiter('monitoring', 40, 60_000));
+app.use('/api', verificationRouter);
+app.use('/api', comparisonRouter);
+app.use('/api', projectsRouter);
+app.use('/api', monitoringRouter);
 
 app.get('/api/auth/tinyfish/status', async (request, response) => {
   let mode;
@@ -98,7 +127,12 @@ app.get('/api/health', async (_request, response) => {
 app.post('/api/search', async (request, response) => {
   const query = typeof request.body?.query === 'string' ? request.body.query.trim() : '';
   if (query.length < 3 || query.length > 500) return response.status(400).json({ error: 'Enter a question between 3 and 500 characters.' });
-  try { return response.json({ results: await searchWeb(query, readSession(request.headers.cookie)) }); }
+  try {
+    const results = (await searchWeb(query, readSession(request.headers.cookie))).filter((item) => isSafePublicWebUrl(item.url));
+    if (!results.length) return response.status(502).json({ error: 'TinyFish Search returned no safe, usable public webpage URLs.' });
+    rememberSearchResults(fetchClientKey(request), results.map((item) => item.url));
+    return response.json({ results });
+  }
   catch (error) { return response.status(tinyFishHttpStatus(error)).json({ error: error instanceof Error ? error.message : 'TinyFish Search failed.' }); }
 });
 
@@ -106,12 +140,15 @@ app.post('/api/fetch', async (request, response) => {
   const query = typeof request.body?.query === 'string' ? request.body.query.trim() : '';
   const urls = Array.isArray(request.body?.urls) ? request.body.urls : [];
   if (query.length < 3 || query.length > 500) return response.status(400).json({ error: 'Include a question between 3 and 500 characters.' });
-  if (!urls.length || urls.length > 10 || urls.some((item: unknown) => typeof item !== 'string' || !/^https?:\/\//i.test(item))) {
+  if (!urls.length || urls.length > 10 || urls.some((item: unknown) => !isSafePublicWebUrl(item))) {
     return response.status(400).json({ error: 'Select between 1 and 10 valid webpage URLs.' });
   }
+  const clientKey = fetchClientKey(request);
+  if (urls.some((url: string) => !isRecentSearchResult(clientKey, url))) return response.status(400).json({ error: 'Select sources from a recent Search result before fetching content.' });
   try {
     const pages = await fetchPages(query, urls as string[], readSession(request.headers.cookie));
-    return response.json({ pages, evidence: buildEvidence(pages) });
+    const evidence = buildEvidence(pages);
+    return response.json({ pages, evidence, verificationId: createVerificationRecord(evidence, pages, query) });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'TinyFish Fetch failed.';
     return response.status(tinyFishHttpStatus(error)).json({ error: message });
@@ -119,4 +156,15 @@ app.post('/api/fetch', async (request, response) => {
 });
 
 const port = Number(process.env.PORT) || 3001;
-app.listen(port, () => console.log(`ProofScout API listening on http://localhost:${port}`));
+app.use((error: unknown, _request: express.Request, response: express.Response, _next: express.NextFunction) => {
+  const details = error as { message?: unknown; status?: unknown; type?: unknown };
+  if (details?.message === 'Cross-origin request denied.') return response.status(403).json({ error: 'Origin not allowed.' });
+  if (details?.type === 'entity.parse.failed') return response.status(400).json({ error: 'Request body must contain valid JSON.' });
+  if (details?.type === 'entity.too.large') return response.status(413).json({ error: 'Request body exceeds the 32 KB limit.' });
+  const status = Number(details?.status);
+  return response.status(status >= 400 && status < 500 ? status : 500).json({ error: status === 413 ? 'Request body exceeds the configured limit.' : 'The API could not complete this request.' });
+});
+app.listen(port, () => {
+  startMonitoringScheduler(db);
+  console.log(`ProofScout API listening on http://localhost:${port}`);
+});

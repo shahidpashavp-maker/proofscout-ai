@@ -5,6 +5,7 @@ Evidence-backed live web research using TinyFish MCP Search and Fetch.
 ## Requirements
 
 - Node.js 20 or newer
+- Research history is stored in `data/proofscout.sqlite` using SQLite. Set `PROOFSCOUT_DB_PATH` to change its location.
 - A TinyFish MCP endpoint that exposes `search` and `fetch_content`
 - An authentication method supported by that endpoint
 
@@ -66,6 +67,12 @@ npm.cmd run dev
 The browser sends `POST /api/search` with `{ "query": "..." }`. The server discovers the MCP `search` tool and calls it with `query` and `purpose`; it returns `{ "results": [{ "title": "...", "url": "https://...", "snippet": "..." }] }`.
 
 The user selects up to ten URLs. The browser sends `POST /api/fetch` with `{ "urls": ["https://..."] }`. The server discovers `fetch_content` and calls it with `urls`, `format: "markdown"`, extraction flags, and `purpose`; it returns `{ "pages": [{ "url": "...", "title": "...", "text": "...", "error": "optional" }], "evidence": [...] }`. Tool arguments and extraction options follow the TinyFish MCP tool schemas; the server accepts structured MCP results and maps them to the UI's response shape.
+
+The fetch response also includes a short-lived `verificationId`. `POST /api/verify` accepts `{ "verificationId": "..." }` and returns `{ "results": [...] }`. The server verifies its stored extracted claims against the fetched page text, preserving each claim's source URL/title and each evidence passage's own URL/title. Verification records expire after 20 minutes and are held in process memory.
+
+`POST /api/compare` accepts the same `{ "verificationId": "..." }` and returns `{ "comparisons": [...] }`. It compares related claims across the fetched pages, retains each passage's provenance, and treats detected copies as a single source. Its agreement and disagreement labels are heuristic comparisons, not conclusions about objective truth.
+
+Research history is managed through `GET /api/projects`, `POST /api/projects` (`{ "name": "..." }`), `PATCH /api/projects/:projectId` (`{ "name": "..." }`), and `DELETE /api/projects/:projectId`. Project sessions are listed at `GET /api/projects/:projectId/sessions`; save the current fetched research with `POST /api/projects/:projectId/sessions` (`{ "verificationId": "..." }`) and reopen one with `GET /api/projects/:projectId/sessions/:sessionId`. Saved sessions include the question, fetched source text and provenance, extracted claims, verification results, comparison results, and creation/update timestamps. SQLite uses parameterized statements and project deletion cascades to its saved sessions.
 
 Configuration and authentication errors are reported without returning OAuth tokens, authorization headers, or client secrets. The browser receives only connection state and safe error text.
 

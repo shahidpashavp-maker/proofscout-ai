@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { getSelectedTinyFishAuthMode, resolveTinyFishAuthSelection, TinyFishAuthConfigurationError, tinyFishApiKeyHeaders } from './tinyfish-auth.js';
-import { normalizeTinyFishFailure } from './tinyfish.js';
+import { checkTinyFishHealth, normalizeTinyFishFailure } from './tinyfish.js';
 
 test('OAuth remains the default mode when no API key is configured', () => {
   assert.equal(getSelectedTinyFishAuthMode({}), 'oauth');
@@ -52,4 +52,21 @@ test('API-key authentication failures preserve safe detail and redact bearer cre
   assert.match(failure.message, /HTTP 401/);
   assert.match(failure.message, /Bearer \[redacted\]/);
   assert.doesNotMatch(failure.message, /fake-test-key-123/);
+});
+
+test('production API-key mode rejects an insecure HTTP MCP endpoint before sending credentials', async () => {
+  const keys = ['NODE_ENV', 'TINYFISH_AUTH_MODE', 'TINYFISH_MCP_TOKEN', 'TINYFISH_MCP_URL'] as const;
+  const original = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  try {
+    process.env.NODE_ENV = 'production';
+    process.env.TINYFISH_AUTH_MODE = 'api_key';
+    process.env.TINYFISH_MCP_TOKEN = 'audit-fake-token';
+    process.env.TINYFISH_MCP_URL = 'http://tinyfish.example/mcp';
+    await assert.rejects(checkTinyFishHealth(undefined), /valid HTTPS URL in production/);
+  } finally {
+    for (const key of keys) {
+      if (original[key] === undefined) delete process.env[key];
+      else process.env[key] = original[key]!;
+    }
+  }
 });
